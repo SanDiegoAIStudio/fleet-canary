@@ -82,20 +82,16 @@ async function handleBeat(request: Request, env: Env, url: URL): Promise<Respons
   const prev = await readState(env, host);
   const now = Date.now();
   const decision = recordBeat(prev, now);
-  // A heartbeat that raises no alert leaves a text Telegram refused earlier in place.
-  await writeState(
-    env,
-    host,
-    decision.alert === null ? withPending(decision.state, prev.pendingAlert) : decision.state,
-  );
+  // A host that beats after being marked down is a recovery worth announcing. The text is
+  // stored with the state before it is sent, so a run that stops in between loses nothing.
+  // A heartbeat that raises no alert leaves a text stored earlier in place.
+  const upText = decision.alert === "up" ? target.label + " is back UP (heartbeat resumed)." : undefined;
+  const stored = decision.alert === "up" ? (telegramReady(env) ? upText : undefined) : prev.pendingAlert;
+  await writeState(env, host, withPending(decision.state, stored));
 
-  // A host that beats after being marked down is a recovery worth announcing.
-  if (decision.alert === "up") {
-    const upText = target.label + " is back UP (heartbeat resumed).";
+  if (upText !== undefined) {
     const upOutcome = await alert(env, upText);
-    if (upOutcome === "failed") {
-      await writeState(env, host, withPending(decision.state, upText));
-    }
+    if (upOutcome !== "failed" && stored === upText) await clearPending(env, host, upText);
   }
 
   return Response.json({ ok: true, host, at: now });
@@ -107,7 +103,7 @@ async function runChecks(env: Env): Promise<string[]> {
   for (const target of TARGETS) {
     const prev = await readState(env, target.id);
 
-    // An alert that Telegram refused earlier goes out first.
+    // A stored alert text goes out first: Telegram refused it, or a run stopped before sending it.
     let pending = prev.pendingAlert;
     if (pending !== undefined) {
       const resent = await alert(env, pending);
@@ -139,11 +135,18 @@ async function runChecks(env: Env): Promise<string[]> {
       message = target.label + " is back UP.";
     }
 
-    // The state is stored before any alert is awaited. A heartbeat that landed while this check
-    // ran has newer state, so this target is left alone until the next run.
-    const decided = withPending(decision.state, message !== null ? undefined : pending);
+    // The state is stored, with the alert text when Telegram is set up, before any alert is
+    // awaited. A heartbeat that landed while this check ran has newer state, so this target is
+    // left alone until the next run, and a text that was resent and accepted is removed from it.
+    const stored = message !== null ? (telegramReady(env) ? message : undefined) : pending;
+    const decided = withPending(decision.state, stored);
     if (needsWrite(prev, decided, now)) {
-      if (await newerBeatLanded(env, target, prev)) continue;
+      if (await newerBeatLanded(env, target, prev)) {
+        if (prev.pendingAlert !== undefined && pending === undefined) {
+          await clearPending(env, target.id, prev.pendingAlert);
+        }
+        continue;
+      }
       await writeState(env, target.id, decided);
     }
 
@@ -151,12 +154,7 @@ async function runChecks(env: Env): Promise<string[]> {
 
     if (message !== null) {
       const outcome = await alert(env, message);
-      if (outcome === "failed") {
-        const kept = withPending(decision.state, message);
-        if (needsWrite(prev, kept, now) && !(await newerBeatLanded(env, target, prev))) {
-          await writeState(env, target.id, kept);
-        }
-      }
+      if (outcome !== "failed" && stored === message) await clearPending(env, target.id, message);
     }
   }
 
@@ -166,6 +164,19 @@ async function runChecks(env: Env): Promise<string[]> {
 function withPending(state: TargetState, pending: string | undefined): TargetState {
   if (pending === undefined) return state;
   return { ...state, pendingAlert: pending };
+}
+
+// Removes a stored alert text once Telegram has accepted it, and only that text.
+async function clearPending(env: Env, id: string, text: string): Promise<void> {
+  const state = await readState(env, id);
+  if (state.pendingAlert !== text) return;
+  const next: TargetState = { ...state };
+  delete next.pendingAlert;
+  await writeState(env, id, next);
+}
+
+function telegramReady(env: Env): boolean {
+  return Boolean(env.TELEGRAM_BOT_TOKEN) && Boolean(env.TELEGRAM_CHAT_ID);
 }
 
 function needsWrite(prev: TargetState, next: TargetState, now: number): boolean {
@@ -236,9 +247,9 @@ async function readAll(env: Env): Promise<Record<string, TargetState & { label: 
 }
 
 async function alert(env: Env, message: string): Promise<AlertOutcome> {
+  if (!telegramReady(env)) return "skipped";
   const token = env.TELEGRAM_BOT_TOKEN;
   const chat = env.TELEGRAM_CHAT_ID;
-  if (!token || !chat) return "skipped";
   try {
     const res = await fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
       method: "POST",

@@ -762,3 +762,87 @@ test("a newer alert that goes through clears an older pending one", async () => 
   await runScheduled(env);
   expect(messages()).toEqual([]);
 });
+
+// source: the alert text was stored only after a failed send, so a run stopped between the
+// write and the send kept the flip and lost the alert
+test("a down alert is stored before it is sent", async () => {
+  const { kv, env } = makeRig();
+  const site = target("site");
+  const downText = site.label + " is DOWN. HTTP 500 (expected 200)\n\nFix: " + site.fix;
+  seed(kv, "site", { status: "up", consecutiveFailures: 1, lastCheck: 1 });
+  routes.set(SITE_URL, answerStatus(500));
+  const seenAtSend: (string | undefined)[] = [];
+  routes.set(TELEGRAM_PREFIX, () => {
+    seenAtSend.push(stored(kv, "site").pendingAlert);
+    return new Response("{}", { status: 200 });
+  });
+
+  await runScheduled(env);
+
+  expect(seenAtSend).toEqual([downText]);
+  expect(stored(kv, "site").status).toBe("down");
+  expect(stored(kv, "site").pendingAlert).toBeUndefined();
+});
+
+test("a back UP heartbeat text is stored before it is sent", async () => {
+  const { kv, env } = makeRig();
+  const upText = target("machine").label + " is back UP (heartbeat resumed).";
+  seed(kv, "machine", { status: "down", consecutiveFailures: 1, lastCheck: 1, lastBeat: 1 });
+  const seenAtSend: (string | undefined)[] = [];
+  routes.set(TELEGRAM_PREFIX, () => {
+    seenAtSend.push(stored(kv, "machine").pendingAlert);
+    return new Response("{}", { status: 200 });
+  });
+
+  const res = await worker.fetch(request("POST", "/beat?host=machine", SECRET), env);
+
+  expect(res.status).toBe(200);
+  expect(seenAtSend).toEqual([upText]);
+  expect(stored(kv, "machine").status).toBe("up");
+  expect(stored(kv, "machine").pendingAlert).toBeUndefined();
+});
+
+// source: a resent text that was accepted while a newer heartbeat landed stayed in the
+// heartbeat's stored state and was sent again on the next check
+test("a resent text is removed even when a newer heartbeat landed during the check", async () => {
+  const { kv, env } = makeRig();
+  const text = target("machine").label + " is back UP (heartbeat resumed).";
+  const base = Date.now() - MINUTE;
+  seed(kv, "site", { status: "up", consecutiveFailures: 0, lastCheck: base });
+  seed(kv, "www", { status: "up", consecutiveFailures: 0, lastCheck: base });
+  seed(kv, "machine", { status: "up", consecutiveFailures: 0, lastCheck: base, lastBeat: base, pendingAlert: text });
+  routes.set(TELEGRAM_PREFIX, () => {
+    const landed: Stored = {
+      status: "up",
+      consecutiveFailures: 0,
+      lastCheck: base + 1000,
+      lastBeat: base + 1000,
+      pendingAlert: text,
+    };
+    kv.store.set("state:machine", JSON.stringify(landed));
+    return new Response("{}", { status: 200 });
+  });
+
+  await runScheduled(env);
+
+  expect(messages()).toEqual([text]);
+  expect(stored(kv, "machine").lastBeat).toBe(base + 1000);
+  expect(stored(kv, "machine").pendingAlert).toBeUndefined();
+
+  calls = [];
+  await runScheduled(env);
+  expect(messages()).toEqual([]);
+});
+
+test("with Telegram unset, a flip is written once", async () => {
+  const { kv, env } = makeRig({});
+  seed(kv, "site", { status: "up", consecutiveFailures: 1, lastCheck: 1 });
+  routes.set(SITE_URL, answerStatus(500));
+
+  await runScheduled(env);
+
+  expect(kv.puts.filter((key) => key === "state:site").length).toBe(1);
+  expect(stored(kv, "site").status).toBe("down");
+  expect(stored(kv, "site").pendingAlert).toBeUndefined();
+  expect(telegramCalls().length).toBe(0);
+});

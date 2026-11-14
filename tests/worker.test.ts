@@ -25,12 +25,14 @@ interface Stored {
   lastCheck: number;
   lastBeat?: number;
   detail?: string;
+  pendingAlert?: string;
 }
 
 type Handler = () => Response;
 
 interface FakeKv {
   store: Map<string, string>;
+  puts: string[];
   get(key: string, type?: string): Promise<unknown>;
   put(key: string, value: string): Promise<void>;
 }
@@ -76,14 +78,17 @@ afterEach(() => {
 
 function makeKv(): FakeKv {
   const store = new Map<string, string>();
+  const puts: string[] = [];
   return {
     store,
+    puts,
     async get(key: string, type?: string): Promise<unknown> {
       const raw = store.get(key);
       if (raw === undefined) return null;
       return type === "json" ? JSON.parse(raw) : raw;
     },
     async put(key: string, value: string): Promise<void> {
+      puts.push(key);
       store.set(key, value);
     },
   };
@@ -428,7 +433,9 @@ test("every alert text that was sent names the target's label, says DOWN or UP, 
   routes.set(SITE_URL, ok);
   await runScheduled(env);
 
-  const lastBeat = Date.now() - 31 * MINUTE;
+  const machineTarget = target("machine");
+  if (machineTarget.kind !== "beat") throw new Error("machine is not a beat target");
+  const lastBeat = Date.now() - (machineTarget.staleAfterMinutes + 1) * MINUTE;
   seed(kv, "machine", { status: "up", consecutiveFailures: 0, lastCheck: lastBeat, lastBeat });
   await runScheduled(env);
   await worker.fetch(request("POST", "/beat?host=machine", SECRET), env);
@@ -608,4 +615,150 @@ test("a stored value of the wrong shape is read as unknown", async () => {
   const res = await worker.fetch(request("GET", "/status"), env);
   const body = (await res.json()) as Record<string, unknown>;
   expect(body.site).toEqual({ ...good, label });
+});
+
+// source: a heartbeat that lands while the cron is checking the same machine must not be
+// overwritten, and a refused alert must be sent again later
+
+test("a heartbeat that lands during a check is not overwritten", async () => {
+  const { kv, env } = makeRig();
+  const machine = target("machine");
+  if (machine.kind !== "beat") throw new Error("machine is not a beat target");
+  const staleBeat = Date.now() - (machine.staleAfterMinutes + 1) * MINUTE;
+  const freshBeat = Date.now();
+  seed(kv, "site", { status: "up", consecutiveFailures: 0, lastCheck: freshBeat });
+  seed(kv, "www", { status: "up", consecutiveFailures: 0, lastCheck: freshBeat });
+  seed(kv, "machine", { status: "up", consecutiveFailures: 0, lastCheck: staleBeat, lastBeat: staleBeat });
+  const realGet = kv.get.bind(kv);
+  let machineReads = 0;
+  kv.get = async (key: string, type?: string): Promise<unknown> => {
+    if (key === "state:machine") {
+      machineReads += 1;
+      if (machineReads >= 2) {
+        const landed: Stored = { status: "up", consecutiveFailures: 0, lastCheck: freshBeat, lastBeat: freshBeat };
+        kv.store.set("state:machine", JSON.stringify(landed));
+      }
+    }
+    return realGet(key, type);
+  };
+
+  await runScheduled(env);
+
+  expect(machineReads).toBeGreaterThanOrEqual(2);
+  expect(stored(kv, "machine").lastBeat).toBe(freshBeat);
+  expect(stored(kv, "machine").status).not.toBe("down");
+  expect(messages()).toEqual([]);
+});
+
+test("a down alert that Telegram refuses is stored and sent on the next tick", async () => {
+  const { kv, env } = makeRig();
+  seed(kv, "site", { status: "up", consecutiveFailures: 1, lastCheck: 1 });
+  routes.set(SITE_URL, answerStatus(500));
+  routes.set(TELEGRAM_PREFIX, answerStatus(500));
+  const downText = target("site").label + " is DOWN. HTTP 500 (expected 200)\n\nFix: " + target("site").fix;
+
+  await runScheduled(env);
+
+  expect(stored(kv, "site").status).toBe("down");
+  expect(stored(kv, "site").pendingAlert).toBe(downText);
+
+  calls = [];
+  routes.set(TELEGRAM_PREFIX, answerStatus(200));
+  await runScheduled(env);
+
+  expect(messages()).toEqual([downText]);
+  expect(stored(kv, "site").status).toBe("down");
+  expect(stored(kv, "site").pendingAlert).toBeUndefined();
+
+  calls = [];
+  await runScheduled(env);
+  expect(messages()).toEqual([]);
+});
+
+test("with no Telegram settings a flip stores no pending alert", async () => {
+  const { kv, env } = makeRig({ secret: SECRET, chat: CHAT });
+  seed(kv, "site", { status: "up", consecutiveFailures: 1, lastCheck: 1 });
+  routes.set(SITE_URL, answerStatus(500));
+
+  await runScheduled(env);
+
+  expect(stored(kv, "site").status).toBe("down");
+  expect(stored(kv, "site").pendingAlert).toBeUndefined();
+  expect(telegramCalls().length).toBe(0);
+});
+
+test("an unchanged target is not written again within the hour", async () => {
+  const { kv, env } = makeRig();
+  const realNow = Date.now;
+  const start = realNow.call(Date);
+  try {
+    Date.now = (): number => start;
+    await runScheduled(env);
+    expect(kv.puts.filter((key) => key === "state:site").length).toBe(1);
+
+    Date.now = (): number => start + 5 * MINUTE;
+    await runScheduled(env);
+    expect(kv.puts.filter((key) => key === "state:site").length).toBe(1);
+    expect(kv.puts.filter((key) => key === "state:machine").length).toBe(1);
+
+    Date.now = (): number => start + 60 * MINUTE;
+    await runScheduled(env);
+    expect(kv.puts.filter((key) => key === "state:site").length).toBe(2);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+// source: a heartbeat stored a state with no pendingAlert, so a back UP text that Telegram had
+// refused was erased before any check could send it
+test("a heartbeat keeps a pending alert", async () => {
+  const { kv, env } = makeRig();
+  const label = target("machine").label;
+  const upText = label + " is back UP (heartbeat resumed).";
+  const freshBeat = Date.now();
+  seed(kv, "site", { status: "up", consecutiveFailures: 0, lastCheck: freshBeat });
+  seed(kv, "www", { status: "up", consecutiveFailures: 0, lastCheck: freshBeat });
+  seed(kv, "machine", {
+    status: "up",
+    consecutiveFailures: 0,
+    lastCheck: freshBeat - MINUTE,
+    lastBeat: freshBeat - MINUTE,
+    pendingAlert: upText,
+  });
+
+  const res = await worker.fetch(request("POST", "/beat?host=machine", SECRET), env);
+
+  expect(res.status).toBe(200);
+  expect(stored(kv, "machine").pendingAlert).toBe(upText);
+  expect(telegramCalls().length).toBe(0);
+
+  await runScheduled(env);
+
+  expect(messages()).toEqual([upText]);
+  expect(stored(kv, "machine").pendingAlert).toBeUndefined();
+});
+
+// source: when a pending text was resent and failed again while a newer alert went through, the
+// older text stayed stored and was sent after the newer one
+test("a newer alert that goes through clears an older pending one", async () => {
+  const { kv, env } = makeRig();
+  const site = target("site");
+  const downText = site.label + " is DOWN. HTTP 500 (expected 200)\n\nFix: " + site.fix;
+  const upText = site.label + " is back UP.";
+  seed(kv, "site", { status: "down", consecutiveFailures: 2, lastCheck: 1, pendingAlert: downText });
+  let sends = 0;
+  routes.set(TELEGRAM_PREFIX, () => {
+    sends += 1;
+    return new Response("stand-in", { status: sends === 1 ? 500 : 200 });
+  });
+
+  await runScheduled(env);
+
+  expect(stored(kv, "site").status).toBe("up");
+  expect(stored(kv, "site").pendingAlert).toBeUndefined();
+  expect(messages()).toEqual([downText, upText]);
+
+  calls = [];
+  await runScheduled(env);
+  expect(messages()).toEqual([]);
 });

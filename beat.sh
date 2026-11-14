@@ -21,6 +21,20 @@ if [ -z "$HOST" ]; then
   exit 2
 fi
 
+# The host goes into the URL as it is, so only plain host characters are allowed.
+plain_host() {
+  local LC_ALL=C
+  case "$1" in
+    *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  return 0
+}
+
+if ! plain_host "$HOST"; then
+  echo "ERROR: host '${HOST}' may hold only letters, digits, dots, dashes and underscores." >&2
+  exit 2
+fi
+
 code="$(curl -sS -m 20 -o /dev/null -w '%{http_code}' \
   -X POST "${CANARY_URL}/beat?host=${HOST}" \
   -H "x-canary-secret: ${CANARY_SECRET}" 2>/dev/null)"

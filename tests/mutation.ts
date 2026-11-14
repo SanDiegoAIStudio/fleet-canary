@@ -217,24 +217,24 @@ const mutations: Mutation[] = [
     file: INDEX,
     testFile: WORKER_TESTS,
     test: "a site that fails twice in a row raises exactly one down alert, on the second failure, and none on the third",
-    from: '} else if (decision.alert === "up") {\n      await alert(env, target.label + " is back UP.");',
-    to: '} else {\n      await alert(env, target.label + " is back UP.");',
+    from: '} else if (decision.alert === "up") {\n      message = target.label + " is back UP.";',
+    to: '} else {\n      message = target.label + " is back UP.";',
   },
   {
     name: "the alert is sent although the Telegram settings are missing",
     file: INDEX,
     testFile: WORKER_TESTS,
     test: "with the Telegram settings missing a flip sends nothing and the new state is still stored",
-    from: "if (!token || !chat) return false;",
-    to: "if (false) return false;",
+    from: 'if (!token || !chat) return "skipped";',
+    to: 'if (false) return "skipped";',
   },
   {
     name: "one missing Telegram setting is tolerated",
     file: INDEX,
     testFile: WORKER_TESTS,
     test: "with the Telegram settings missing a flip sends nothing and the new state is still stored",
-    from: "if (!token || !chat) return false;",
-    to: "if (!token && !chat) return false;",
+    from: 'if (!token || !chat) return "skipped";',
+    to: 'if (!token && !chat) return "skipped";',
   },
   {
     name: "the baseline run alerts on first sight",
@@ -281,8 +281,8 @@ const mutations: Mutation[] = [
     file: INDEX,
     testFile: WORKER_TESTS,
     test: "every alert text that was sent names the target's label, says DOWN or UP, and holds only ASCII characters",
-    from: 'await alert(env, target.label + " is DOWN. "',
-    to: 'await alert(env, "\\u{1F534} " + target.label + " is DOWN. "',
+    from: 'message = target.label + " is DOWN. "',
+    to: 'message = "\\u{1F534} " + target.label + " is DOWN. "',
   },
   {
     name: "the test alert carries a pictograph",
@@ -329,7 +329,7 @@ const mutations: Mutation[] = [
     file: INDEX,
     testFile: WORKER_TESTS,
     test: "an alert send that throws does not stop the run",
-    from: "    // Alerting must never take the check loop down with it.\n    return false;",
+    from: '    // Alerting must never take the check loop down with it.\n    return "failed";',
     to: "    // Alerting must never take the check loop down with it.\n    throw new Error(\"alert failed\");",
   },
   {
@@ -345,7 +345,7 @@ const mutations: Mutation[] = [
     file: INDEX,
     testFile: WORKER_TESTS,
     test: "POST /test-alert reports whether Telegram took the message",
-    from: "return Response.json({ sent });",
+    from: 'return Response.json({ sent: outcome === "sent" });',
     to: "return Response.json({ sent: true });",
   },
   {
@@ -353,8 +353,8 @@ const mutations: Mutation[] = [
     file: INDEX,
     testFile: WORKER_TESTS,
     test: "POST /test-alert reports whether Telegram took the message",
-    from: "return res.ok;",
-    to: "return true;",
+    from: 'return res.ok ? "sent" : "failed";',
+    to: 'return "sent";',
   },
   {
     name: "chat_id dropped from the alert body",
@@ -548,6 +548,70 @@ const mutations: Mutation[] = [
     from: "HOST=\"${CANARY_HOST:-$(hostname -s)}\"",
     to: "HOST=\"$(hostname -s)\"",
   },
+  {
+    name: "the fresh-read check before a write is removed",
+    file: INDEX,
+    testFile: WORKER_TESTS,
+    test: "a heartbeat that lands during a check is not overwritten",
+    from: "if (await newerBeatLanded(env, target, prev)) continue;",
+    to: "",
+  },
+  {
+    name: "a refused alert is not kept as pendingAlert",
+    file: INDEX,
+    testFile: WORKER_TESTS,
+    test: "a down alert that Telegram refuses is stored and sent on the next tick",
+    from: "if (outcome === \"failed\") {",
+    to: "if (false) {",
+  },
+  {
+    name: "the kept pendingAlert is never sent again",
+    file: INDEX,
+    testFile: WORKER_TESTS,
+    test: "a down alert that Telegram refuses is stored and sent on the next tick",
+    from: "const resent = await alert(env, pending);",
+    to: "const resent: AlertOutcome = \"sent\";",
+  },
+  {
+    name: "a skipped send is treated as failed",
+    file: INDEX,
+    testFile: WORKER_TESTS,
+    test: "with no Telegram settings a flip stores no pending alert",
+    from: "if (!token || !chat) return \"skipped\";",
+    to: "if (!token || !chat) return \"failed\";",
+  },
+  {
+    name: "every check writes every target",
+    file: INDEX,
+    testFile: WORKER_TESTS,
+    test: "an unchanged target is not written again within the hour",
+    from: "if (needsWrite(prev, decided, now)) {",
+    to: "if (true) {",
+  },
+  {
+    name: "beat.sh accepts any host",
+    file: BEAT_SH,
+    testFile: BEAT_TESTS,
+    test: "beat.sh refuses a host with a space and sends nothing",
+    from: "if ! plain_host \"$HOST\"; then",
+    to: "if false; then",
+  },
+  {
+    name: "a heartbeat drops a pending alert",
+    file: INDEX,
+    testFile: WORKER_TESTS,
+    test: "a heartbeat keeps a pending alert",
+    from: "decision.alert === null ? withPending(decision.state, prev.pendingAlert) : decision.state",
+    to: "decision.state",
+  },
+  {
+    name: "a newer alert leaves an older pending one stored",
+    file: INDEX,
+    testFile: WORKER_TESTS,
+    test: "a newer alert that goes through clears an older pending one",
+    from: "withPending(decision.state, message !== null ? undefined : pending)",
+    to: "withPending(decision.state, pending)",
+  },
 ];
 
 const projectRoot = join(import.meta.dir, "..");
@@ -604,8 +668,12 @@ function namedResult(output: string, name: string): "pass" | "fail" | "missing" 
   let found: "pass" | "fail" | "missing" = "missing";
   for (const line of plain.split(/\r?\n/)) {
     const text = line.trim();
-    if (text.startsWith("(fail) " + name)) found = "fail";
-    else if (text.startsWith("(pass) " + name) && found !== "fail") found = "pass";
+    const kind = text.startsWith("(fail) ") ? "fail" : text.startsWith("(pass) ") ? "pass" : null;
+    if (kind === null) continue;
+    const rest = text.slice("(fail) ".length);
+    if (rest !== name && !rest.startsWith(name + " [")) continue;
+    if (kind === "fail") found = "fail";
+    else if (found !== "fail") found = "pass";
   }
   return found;
 }

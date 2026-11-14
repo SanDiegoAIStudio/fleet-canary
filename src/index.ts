@@ -19,6 +19,9 @@ export interface Env {
 }
 
 const STATE_PREFIX = "state:";
+const HOUR = 60 * 60 * 1000;
+
+type AlertOutcome = "sent" | "skipped" | "failed";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -50,8 +53,8 @@ export default {
       if (!beatAuthorized(request.headers.get("x-canary-secret"), env.BEAT_SECRET)) {
         return new Response("unauthorized", { status: 401 });
       }
-      const sent = await alert(env, "fleet-canary test alert. If you see this, the alert path works.");
-      return Response.json({ sent });
+      const outcome = await alert(env, "fleet-canary test alert. If you see this, the alert path works.");
+      return Response.json({ sent: outcome === "sent" });
     }
 
     if (url.pathname === "/") return new Response(renderPage(), {
@@ -79,11 +82,20 @@ async function handleBeat(request: Request, env: Env, url: URL): Promise<Respons
   const prev = await readState(env, host);
   const now = Date.now();
   const decision = recordBeat(prev, now);
-  await writeState(env, host, decision.state);
+  // A heartbeat that raises no alert leaves a text Telegram refused earlier in place.
+  await writeState(
+    env,
+    host,
+    decision.alert === null ? withPending(decision.state, prev.pendingAlert) : decision.state,
+  );
 
   // A host that beats after being marked down is a recovery worth announcing.
   if (decision.alert === "up") {
-    await alert(env, target.label + " is back UP (heartbeat resumed).");
+    const upText = target.label + " is back UP (heartbeat resumed).";
+    const upOutcome = await alert(env, upText);
+    if (upOutcome === "failed") {
+      await writeState(env, host, withPending(decision.state, upText));
+    }
   }
 
   return Response.json({ ok: true, host, at: now });
@@ -94,6 +106,14 @@ async function runChecks(env: Env): Promise<string[]> {
 
   for (const target of TARGETS) {
     const prev = await readState(env, target.id);
+
+    // An alert that Telegram refused earlier goes out first.
+    let pending = prev.pendingAlert;
+    if (pending !== undefined) {
+      const resent = await alert(env, pending);
+      if (resent !== "failed") pending = undefined;
+    }
+
     const now = Date.now();
     const decision = target.kind === "http"
       ? decideScheduled({
@@ -112,18 +132,58 @@ async function runChecks(env: Env): Promise<string[]> {
           staleAfterMinutes: target.staleAfterMinutes,
         });
 
-    if (decision.change) changes.push(decision.change);
-
+    let message: string | null = null;
     if (decision.alert === "down") {
-      await alert(env, target.label + " is DOWN. " + (decision.state.detail || "") + "\n\nFix: " + target.fix);
+      message = target.label + " is DOWN. " + (decision.state.detail || "") + "\n\nFix: " + target.fix;
     } else if (decision.alert === "up") {
-      await alert(env, target.label + " is back UP.");
+      message = target.label + " is back UP.";
     }
 
-    await writeState(env, target.id, decision.state);
+    // The state is stored before any alert is awaited. A heartbeat that landed while this check
+    // ran has newer state, so this target is left alone until the next run.
+    const decided = withPending(decision.state, message !== null ? undefined : pending);
+    if (needsWrite(prev, decided, now)) {
+      if (await newerBeatLanded(env, target, prev)) continue;
+      await writeState(env, target.id, decided);
+    }
+
+    if (decision.change) changes.push(decision.change);
+
+    if (message !== null) {
+      const outcome = await alert(env, message);
+      if (outcome === "failed") {
+        const kept = withPending(decision.state, message);
+        if (needsWrite(prev, kept, now) && !(await newerBeatLanded(env, target, prev))) {
+          await writeState(env, target.id, kept);
+        }
+      }
+    }
   }
 
   return changes;
+}
+
+function withPending(state: TargetState, pending: string | undefined): TargetState {
+  if (pending === undefined) return state;
+  return { ...state, pendingAlert: pending };
+}
+
+function needsWrite(prev: TargetState, next: TargetState, now: number): boolean {
+  return (
+    next.status !== prev.status ||
+    next.consecutiveFailures !== prev.consecutiveFailures ||
+    next.lastBeat !== prev.lastBeat ||
+    next.detail !== prev.detail ||
+    next.pendingAlert !== prev.pendingAlert ||
+    now - prev.lastCheck >= HOUR
+  );
+}
+
+async function newerBeatLanded(env: Env, target: Target, basis: TargetState): Promise<boolean> {
+  if (target.kind !== "beat") return false;
+  const fresh = await readState(env, target.id);
+  if (fresh.lastBeat === undefined) return false;
+  return basis.lastBeat === undefined || fresh.lastBeat > basis.lastBeat;
 }
 
 async function checkHttp(target: Extract<Target, { kind: "http" }>): Promise<CheckResult> {
@@ -153,6 +213,7 @@ function isTargetState(raw: unknown): raw is TargetState {
   if (typeof raw.lastCheck !== "number") return false;
   if (raw.lastBeat !== undefined && typeof raw.lastBeat !== "number") return false;
   if (raw.detail !== undefined && typeof raw.detail !== "string") return false;
+  if (raw.pendingAlert !== undefined && typeof raw.pendingAlert !== "string") return false;
   return true;
 }
 
@@ -174,10 +235,10 @@ async function readAll(env: Env): Promise<Record<string, TargetState & { label: 
   return out;
 }
 
-async function alert(env: Env, message: string): Promise<boolean> {
+async function alert(env: Env, message: string): Promise<AlertOutcome> {
   const token = env.TELEGRAM_BOT_TOKEN;
   const chat = env.TELEGRAM_CHAT_ID;
-  if (!token || !chat) return false;
+  if (!token || !chat) return "skipped";
   try {
     const res = await fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
       method: "POST",
@@ -185,10 +246,10 @@ async function alert(env: Env, message: string): Promise<boolean> {
       body: JSON.stringify({ chat_id: chat, text: message, disable_web_page_preview: true }),
       signal: AbortSignal.timeout(12000),
     });
-    return res.ok;
+    return res.ok ? "sent" : "failed";
   } catch {
     // Alerting must never take the check loop down with it.
-    return false;
+    return "failed";
   }
 }
 

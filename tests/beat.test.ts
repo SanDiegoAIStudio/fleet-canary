@@ -137,3 +137,14 @@ test("beat.sh uses the short hostname when CANARY_HOST is unset", async () => {
   expect(outcome.seen.length).toBe(1);
   expect(outcome.seen[0]?.query === "host=stand-in-host").toBe(true);
 });
+
+test("beat.sh refuses a host with a space and sends nothing", async () => {
+  const outcome = await runBeat({
+    env: { CANARY_SECRET: SECRET, CANARY_HOST: "a b" },
+    url: (origin) => origin,
+  });
+
+  expect(outcome.code).toBe(2);
+  expect(outcome.stderr).toContain("may hold only letters");
+  expect(outcome.seen).toEqual([]);
+});

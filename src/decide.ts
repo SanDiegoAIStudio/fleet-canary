@@ -9,6 +9,7 @@ export interface TargetState {
   lastCheck: number;
   lastBeat?: number;
   detail?: string;
+  pendingAlert?: string;
 }
 
 export interface CheckResult {
